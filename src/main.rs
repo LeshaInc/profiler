@@ -25,6 +25,8 @@ use anyhow::{anyhow, Result};
 enum EventKind {
     Perf,
     CpuUsage,
+    MemoryUsage,
+    GlobalMemoryUsage,
     Temperature,
     DiskRead,
     DiskWrite,
@@ -67,6 +69,60 @@ fn get_process_stat(pid: u32, tid: u32) -> Result<ProcessStat> {
     res.ok_or_else(|| anyhow!("invalid proc format"))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MemoryRegion {
+    size: u64,
+    offset: u64,
+    inode: u32,
+    flags: u8,
+}
+
+const FLAG_PRIVATE: u8 = 8;
+const FLAG_READ: u8 = 4;
+const FLAG_WRITE: u8 = 2;
+const FLAG_EXECUTE: u8 = 1;
+
+fn get_process_maps(pid: u32) -> Result<Vec<MemoryRegion>> {
+    let buf = fs::read_to_string(format!("/proc/{pid}/maps"))?;
+
+    let mut regions = Vec::new();
+    for line in buf.lines() {
+        let res = (|| {
+            let mut fields = line.split(' ');
+            let range = fields.next()?;
+            let size = {
+                let mut fields = range.split('-');
+                let start = u64::from_str_radix(fields.next()?, 16).ok()?;
+                let end = u64::from_str_radix(fields.next()?, 16).ok()?;
+                end - start
+            };
+            let flags = fields.next()?;
+            let flags = {
+                let r = u8::from(flags.contains('r'));
+                let w = u8::from(flags.contains('w'));
+                let x = u8::from(flags.contains('x'));
+                let p = u8::from(flags.contains('p'));
+                p * 8 + r * 4 + w * 2 + x
+            };
+            let offset = fields.next()?.parse::<u64>().ok()?;
+            fields.next()?;
+            let inode = fields.next()?.parse::<u32>().ok()?;
+            Some(MemoryRegion {
+                size,
+                offset,
+                inode,
+                flags,
+            })
+        })();
+
+        if let Some(res) = res {
+            regions.push(res);
+        }
+    }
+
+    Ok(regions)
+}
+
 fn get_cpu_time() -> Result<f64> {
     let buf = fs::read_to_string(format!("/proc/stat"))?;
 
@@ -105,7 +161,7 @@ fn get_process_parent(pid: u32) -> Result<u32> {
     Ok(get_process_stat(pid, pid)?.ppid)
 }
 
-fn get_process_tree(root: u32) -> Result<Vec<(u32, u32)>> {
+fn get_process_tree(root: u32, include_tasks: bool) -> Result<Vec<(u32, u32)>> {
     let mut visited = Vec::new();
     let mut queued = Vec::new();
 
@@ -122,7 +178,9 @@ fn get_process_tree(root: u32) -> Result<Vec<(u32, u32)>> {
                 continue;
             };
 
-            visited.push((pid, tid));
+            if include_tasks || pid == tid {
+                visited.push((pid, tid));
+            }
 
             let mut path = entry.path();
             path.push("children");
@@ -162,15 +220,69 @@ fn get_process_network_usage(pid: u32, tid: u32, iface: &str) -> Result<(u64, u6
     Ok((0, 0))
 }
 
-async fn sample_cpu_usage(sender: Sender<Event>, interval: Duration, pid: u32) -> Result<()> {
+fn get_process_memory_usage(pid: u32) -> Result<u64> {
+    let mut usage = 0;
+
+    for (pid, _) in get_process_tree(pid, false)? {
+        for map in get_process_maps(pid)? {
+            if map.flags & FLAG_PRIVATE > 0 && map.flags & FLAG_WRITE > 0 {
+                usage += map.size;
+            }
+        }
+    }
+
+    Ok(usage)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MemInfo {
+    total: u64,
+    used: u64,
+    free: u64,
+    available: u64,
+    buffers: u64,
+    cached: u64,
+}
+
+fn get_memory_info() -> Result<MemInfo> {
+    let buf = fs::read_to_string(format!("/proc/meminfo"))?;
+
+    let mut info = MemInfo::default();
+
+    for line in buf.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let Some(field) = fields.next() else {
+            continue;
+        };
+
+        let Some(value) = fields.next().and_then(|v| v.parse::<u64>().ok()) else {
+            continue;
+        };
+
+        match field {
+            "MemTotal:" => info.total = value,
+            "MemFree:" => info.free = value,
+            "MemAvailable:" => info.available = value,
+            "Buffers:" => info.buffers = value,
+            "Cached:" => info.cached = value,
+            _ => {}
+        }
+    }
+
+    info.used = info.total - info.free;
+
+    Ok(info)
+}
+
+async fn sample_cpu_usage(sender: Sender<Event>, interval: Duration, root_pid: u32) -> Result<()> {
     let mut last_cpu_time = None;
     let mut last_task_times = HashMap::new();
 
-    while PathBuf::from(format!("/proc/{pid}/")).exists() {
+    while PathBuf::from(format!("/proc/{root_pid}/")).exists() {
         let instant = Instant::now();
         let cpu_time = get_cpu_time()?;
 
-        for (pid, tid) in get_process_tree(pid)? {
+        for (pid, tid) in get_process_tree(root_pid, true)? {
             let stat = get_process_stat(pid, tid)?;
             let task_time = stat.utime + stat.stime;
 
@@ -185,7 +297,7 @@ async fn sample_cpu_usage(sender: Sender<Event>, interval: Duration, pid: u32) -
                     instant,
                     kind: EventKind::CpuUsage,
                     pid: tid,
-                    label: None,
+                    label: Some(format!("{root_pid}")),
                     value: cpu_usage,
                 };
 
@@ -201,6 +313,57 @@ async fn sample_cpu_usage(sender: Sender<Event>, interval: Duration, pid: u32) -
     }
 
     Ok(())
+}
+
+async fn sample_memory_usage(sender: Sender<Event>, interval: Duration, pid: u32) -> Result<()> {
+    while PathBuf::from(format!("/proc/{pid}/")).exists() {
+        let instant = Instant::now();
+
+        let usage = get_process_memory_usage(pid)?;
+        let event = Event {
+            instant,
+            kind: EventKind::MemoryUsage,
+            pid: 0,
+            label: Some(format!("{pid}")),
+            value: usage as f32,
+        };
+
+        let _ = sender.send(event).await;
+
+        Timer::at(instant + interval).await;
+    }
+
+    Ok(())
+}
+
+async fn sample_global_memory_usage(sender: Sender<Event>, interval: Duration) -> Result<()> {
+    loop {
+        let instant = Instant::now();
+        let info = get_memory_info()?;
+
+        let values = [
+            ("Total", info.total),
+            ("Used", info.used),
+            ("Free", info.free),
+            ("Available", info.available),
+            ("Buffers", info.buffers),
+            ("Cached", info.cached),
+        ];
+
+        for (name, value) in values {
+            let event = Event {
+                instant,
+                kind: EventKind::GlobalMemoryUsage,
+                pid: 0,
+                label: Some(name.into()),
+                value: value as f32,
+            };
+
+            let _ = sender.send(event).await;
+        }
+
+        Timer::at(instant + interval).await;
+    }
 }
 
 async fn sample_temperature(sender: Sender<Event>, interval: Duration) -> Result<()> {
@@ -241,7 +404,11 @@ async fn sample_temperature(sender: Sender<Event>, interval: Duration) -> Result
     }
 }
 
-async fn sample_disk_usage(sender: Sender<Event>, interval: Duration, root_pid: u32) -> Result<()> {
+async fn sample_disk_usage(
+    sender: Sender<Event>,
+    interval: Duration,
+    root_pids: Vec<u32>,
+) -> Result<()> {
     let child = Command::new("iotop")
         .args(["-tPkoqqq"])
         .arg("-d")
@@ -276,38 +443,40 @@ async fn sample_disk_usage(sender: Sender<Event>, interval: Duration, root_pid: 
             continue;
         };
 
-        let mut cur_pid = pid;
-        while cur_pid != root_pid {
-            if let Ok(parent) = get_process_parent(cur_pid) {
-                cur_pid = parent;
-            } else {
-                break;
+        for &root_pid in &root_pids {
+            let mut cur_pid = pid;
+            while cur_pid != root_pid {
+                if let Ok(parent) = get_process_parent(cur_pid) {
+                    cur_pid = parent;
+                } else {
+                    break;
+                }
             }
+
+            if cur_pid != root_pid {
+                continue;
+            }
+
+            let event = Event {
+                instant,
+                kind: EventKind::DiskRead,
+                pid,
+                label: Some(format!("{root_pid}")),
+                value: disk_read * 1024.0,
+            };
+
+            let _ = sender.send(event).await;
+
+            let event = Event {
+                instant,
+                kind: EventKind::DiskWrite,
+                pid,
+                label: Some(format!("{root_pid}")),
+                value: disk_write * 1024.0,
+            };
+
+            let _ = sender.send(event).await;
         }
-
-        if cur_pid != root_pid {
-            continue;
-        }
-
-        let event = Event {
-            instant,
-            kind: EventKind::DiskRead,
-            pid,
-            label: None,
-            value: disk_read * 1024.0,
-        };
-
-        let _ = sender.send(event).await;
-
-        let event = Event {
-            instant,
-            kind: EventKind::DiskWrite,
-            pid,
-            label: None,
-            value: disk_write * 1024.0,
-        };
-
-        let _ = sender.send(event).await;
     }
 
     Ok(())
@@ -327,7 +496,7 @@ async fn sample_network_usage(
         let elapsed = instant.saturating_duration_since(last_instant);
         last_instant = instant;
 
-        for (pid, tid) in get_process_tree(root_pid)? {
+        for (pid, tid) in get_process_tree(root_pid, true)? {
             let (tx, rx) = get_process_network_usage(pid, tid, &iface)?;
 
             if let Some(&(last_tx, last_rx)) = last_task_tx_rx.get(&tid) {
@@ -338,7 +507,7 @@ async fn sample_network_usage(
                     instant,
                     kind: EventKind::NetworkIn,
                     pid,
-                    label: None,
+                    label: Some(format!("{root_pid}")),
                     value: net_in,
                 };
 
@@ -348,7 +517,7 @@ async fn sample_network_usage(
                     instant,
                     kind: EventKind::NetworkOut,
                     pid,
-                    label: None,
+                    label: Some(format!("{root_pid}")),
                     value: net_out,
                 };
 
@@ -397,7 +566,11 @@ async fn sample_perf(sender: Sender<Event>, fifo: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn preprocess_data(events: &[&Event], start_instant: Instant) -> (f32, Vec<Vec<(f32, f32)>>) {
+fn preprocess_data(
+    events: &[&Event],
+    aggregate: bool,
+    start_instant: Instant,
+) -> (f32, Vec<Vec<(f32, f32)>>) {
     let max_sum = events
         .iter()
         .group_by(|e| e.instant)
@@ -440,11 +613,25 @@ fn preprocess_data(events: &[&Event], start_instant: Instant) -> (f32, Vec<Vec<(
             }
         });
 
+    if aggregate {
+        let sum = series.iter().cloned().reduce(|a, b| {
+            a.iter()
+                .zip(b)
+                .map(|(a, b)| (a.0, a.1 + b.1))
+                .collect::<Vec<_>>()
+        });
+
+        if let Some(sum) = sum {
+            series = vec![sum];
+        }
+    }
+
     (max_sum, series)
 }
 
 fn plot(
     events: &[Event],
+    aggregate: bool,
     start_instant: Instant,
     elapsed: f32,
     filter_kind: EventKind,
@@ -459,7 +646,7 @@ fn plot(
         .into_iter()
         .map(|(label, events)| {
             let events = events.collect::<Vec<_>>();
-            let (max_value, series) = preprocess_data(&events, start_instant);
+            let (max_value, series) = preprocess_data(&events, aggregate, start_instant);
             (label.as_ref(), max_value, series)
         })
         .collect::<Vec<_>>();
@@ -470,7 +657,7 @@ fn plot(
         max_value = 1.0;
     }
 
-    let root = SVGBackend::new(output, (1280, 720)).into_drawing_area();
+    let root = SVGBackend::new(output, (640, 480)).into_drawing_area();
     root.fill(&RGBColor(255, 255, 255))?;
 
     let mut chart = ChartBuilder::on(&root)
@@ -563,6 +750,12 @@ struct Args {
     /// CPU utilization
     #[arg(short, long)]
     cpu: bool,
+    /// Memory usage
+    #[arg(short, long)]
+    memory: bool,
+    /// Memory usage (global)
+    #[arg(short = 'M', long)]
+    global_memory: bool,
     /// Temperature sensors (requiers sensors)
     #[arg(short, long)]
     temperature: bool,
@@ -575,11 +768,15 @@ struct Args {
     /// Network interface
     #[arg(short = 'N', long, default_value = "lo")]
     net_iface: String,
+    /// List of pids to sample
+    #[arg(short = 'P', long, use_value_delimiter = true)]
+    pids: Option<Vec<u32>>,
     /// List of perf events to record (requires perf)
-    #[arg(short, long)]
+    #[arg(short, long, conflicts_with = "pids")]
     perf: Option<String>,
     /// Program to run
-    program: OsString,
+    #[arg(required_unless_present = "pids")]
+    program: Option<OsString>,
     /// Arguments passed to the program
     args: Vec<OsString>,
 }
@@ -599,18 +796,25 @@ async fn async_main() -> Result<()> {
         })
         .transpose()?;
 
-    let mut child = if let (Some(perf), Some(fifo)) = (&args.perf, &fifo) {
-        Command::new("perf")
-            .args(["stat", "-e", perf, "-x", ";", "-I"])
-            .arg(format!("{}", interval.as_millis().max(10)))
-            .arg("-o")
-            .arg(fifo)
-            .arg("--")
-            .arg(args.program)
-            .args(args.args)
-            .spawn()?
+    let (pids, child) = if let Some(program) = args.program {
+        let child = if let (Some(perf), Some(fifo)) = (&args.perf, &fifo) {
+            Command::new("perf")
+                .args(["stat", "-e", perf, "-x", ";", "-I"])
+                .arg(format!("{}", interval.as_millis().max(10)))
+                .arg("-o")
+                .arg(fifo)
+                .arg("--")
+                .arg(program)
+                .args(args.args)
+                .spawn()?
+        } else {
+            Command::new(program).args(args.args).spawn()?
+        };
+
+        (vec![child.id()], Some(child))
     } else {
-        Command::new(args.program).args(args.args).spawn()?
+        let pids = args.pids.unwrap();
+        (pids, None)
     };
 
     let start_instant = Instant::now();
@@ -618,7 +822,19 @@ async fn async_main() -> Result<()> {
     let (sender, receiver) = smol::channel::unbounded();
 
     if args.cpu {
-        spawn_task(sample_cpu_usage(sender.clone(), interval, child.id()));
+        for &pid in &pids {
+            spawn_task(sample_cpu_usage(sender.clone(), interval, pid));
+        }
+    }
+
+    if args.memory {
+        for &pid in &pids {
+            spawn_task(sample_memory_usage(sender.clone(), interval, pid));
+        }
+    }
+
+    if args.global_memory {
+        spawn_task(sample_global_memory_usage(sender.clone(), interval));
     }
 
     if args.temperature {
@@ -626,23 +842,34 @@ async fn async_main() -> Result<()> {
     }
 
     if args.disk {
-        spawn_task(sample_disk_usage(sender.clone(), interval, child.id()));
+        spawn_task(sample_disk_usage(sender.clone(), interval, pids.clone()));
     }
 
     if args.network {
-        spawn_task(sample_network_usage(
-            sender.clone(),
-            interval,
-            child.id(),
-            args.net_iface.clone(),
-        ));
+        for &pid in &pids {
+            spawn_task(sample_network_usage(
+                sender.clone(),
+                interval,
+                pid,
+                args.net_iface.clone(),
+            ));
+        }
     }
 
     if let Some(fifo) = fifo {
         spawn_task(sample_perf(sender.clone(), fifo));
     }
 
-    child.status().await?;
+    if let Some(mut child) = child {
+        child.status().await?;
+    } else {
+        while pids
+            .iter()
+            .any(|pid| PathBuf::from(format!("/proc/{pid}/")).exists())
+        {
+            Timer::after(interval).await;
+        }
+    }
 
     let end_instant = Instant::now();
     let elapsed = end_instant
@@ -668,6 +895,18 @@ async fn async_main() -> Result<()> {
             EventKind::CpuUsage,
             "plots/cpu_usage.svg",
             "CPU utilization",
+        ),
+        (
+            args.memory,
+            EventKind::MemoryUsage,
+            "plots/memory_usage.svg",
+            "Memory usage",
+        ),
+        (
+            args.global_memory,
+            EventKind::GlobalMemoryUsage,
+            "plots/global_memory_usage.svg",
+            "Memory usage (Global)",
         ),
         (
             args.temperature,
@@ -704,7 +943,15 @@ async fn async_main() -> Result<()> {
     for (cond, kind, output, title) in kinds {
         if cond {
             let output = output.as_ref();
-            plot(&events, start_instant, elapsed, kind, title, output)?;
+            plot(
+                &events,
+                pids.len() > 1,
+                start_instant,
+                elapsed,
+                kind,
+                title,
+                output,
+            )?;
         }
     }
 
